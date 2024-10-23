@@ -13,7 +13,7 @@ from rest_framework.serializers import (
     ValidationError,
     Serializer,
 )
-from pulpcore.plugin.models import Artifact, Content, CreatedResource, RemoteArtifact
+from pulpcore.plugin.models import Artifact, Content, CreatedResource
 from pulpcore.plugin.serializers import (
     ContentChecksumSerializer,
     MultipleArtifactContentSerializer,
@@ -466,7 +466,7 @@ class BasePackage822Serializer(SingleArtifactContentSerializer):
         package_fields["custom_fields"] = custom_fields
         return cls(data=package_fields, **kwargs)
 
-    def to822(self, component=""):
+    def to822(self, component="", artifact_dict=None, remote_artifact_dict=None):
         """Create deb822.Package object from model."""
         ret = deb822.Packages()
 
@@ -479,25 +479,18 @@ class BasePackage822Serializer(SingleArtifactContentSerializer):
         if custom_fields:
             ret.update(custom_fields)
 
-        try:
-            artifact = self.instance._artifacts.get()
-            artifact.touch()  # Orphan cleanup protection until we are done!
-            if artifact.md5:
-                ret["MD5sum"] = artifact.md5
-            if artifact.sha1:
-                ret["SHA1"] = artifact.sha1
-            ret["SHA256"] = artifact.sha256
-            ret["Size"] = str(artifact.size)
-        except Artifact.DoesNotExist:
-            artifact = RemoteArtifact.objects.filter(sha256=self.instance.sha256).first()
-            if artifact.md5:
-                ret["MD5sum"] = artifact.md5
-            if artifact.sha1:
-                ret["SHA1"] = artifact.sha1
-            ret["SHA256"] = artifact.sha256
-            ret["Size"] = str(artifact.size)
+        artifact = None
+        if artifact_dict and self.instance.sha256 in artifact_dict:
+            artifact = artifact_dict[self.instance.sha256]
+        elif remote_artifact_dict and self.instance.sha256 in remote_artifact_dict:
+            artifact = remote_artifact_dict[self.instance.sha256]
 
-        ret["Filename"] = self.instance.filename(component)
+        if artifact:
+            ret.update({"MD5sum": artifact.md5} if artifact.md5 else {})
+            ret.update({"SHA1": artifact.sha1} if artifact.sha1 else {})
+            ret.update({"SHA256": artifact.sha256})
+            ret.update({"Size": str(artifact.size)})
+        ret.update({"Filename": self.instance.filename(component)})
 
         return ret
 
@@ -863,12 +856,16 @@ class ReleaseComponentSerializer(NoArtifactContentSerializer):
 
     component = CharField(help_text="Name of the component.")
     distribution = CharField(help_text="Name of the distribution.")
+    plain_component = CharField(
+        help_text="Name of the component without any path prefixes.", read_only=True
+    )
 
     class Meta(NoArtifactContentSerializer.Meta):
         model = ReleaseComponent
         fields = NoArtifactContentSerializer.Meta.fields + (
             "component",
             "distribution",
+            "plain_component",
         )
 
 
@@ -1146,6 +1143,7 @@ class SourcePackageSerializer(MultipleArtifactContentSerializer):
         ),
         required=False,
     )
+    sha256 = CharField(help_text=_("sha256 digest of the dsc file."), read_only=True)
     format = CharField(read_only=True)
     source = CharField(read_only=True)
     binary = CharField(read_only=True)
@@ -1245,6 +1243,7 @@ class SourcePackageSerializer(MultipleArtifactContentSerializer):
         fields = MultipleArtifactContentSerializer.Meta.fields + (
             "artifact",
             "relative_path",
+            "sha256",
             "format",
             "source",
             "binary",

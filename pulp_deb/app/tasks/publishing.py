@@ -11,12 +11,15 @@ import tempfile
 
 from django.conf import settings
 from django.core.files import File
+from django.db import transaction
 from django.db.utils import IntegrityError
 from django.forms.models import model_to_dict
 
 from pulpcore.plugin.models import (
+    Artifact,
     PublishedArtifact,
     PublishedMetadata,
+    RemoteArtifact,
     RepositoryVersion,
 )
 
@@ -146,15 +149,16 @@ def publish(
 
                 packages = Package.objects.filter(
                     pk__in=repo_version.content.order_by("-pulp_created")
+                ).prefetch_related("contentartifact_set", "_artifacts")
+                artifact_dict, remote_artifact_dict = _batch_fetch_artifacts(packages)
+                release_helper.components[component].add_packages(
+                    packages, artifact_dict, remote_artifact_dict
                 )
-                for package in packages:
-                    release_helper.components[component].add_package(package)
 
                 source_packages = SourcePackage.objects.filter(
                     pk__in=repo_version.content.order_by("-pulp_created"),
                 )
-                for source_package in source_packages:
-                    release_helper.components[component].add_source_package(source_package)
+                release_helper.components[component].add_source_packages(source_packages)
 
                 release_helper.finish()
 
@@ -242,10 +246,6 @@ def publish(
                         pk__in=repo_version.content.order_by("-pulp_created"),
                         release_component__in=release_components_filtered,
                     ).select_related("release_component", "package")
-                    for prc in package_release_components:
-                        release_helper.components[prc.release_component.component].add_package(
-                            prc.package
-                        )
 
                     source_package_release_components = (
                         SourcePackageReleaseComponent.objects.filter(
@@ -253,10 +253,28 @@ def publish(
                             release_component__in=release_components_filtered,
                         ).select_related("release_component", "source_package")
                     )
-                    for drc in source_package_release_components:
-                        release_helper.components[
-                            drc.release_component.component
-                        ].add_source_package(drc.source_package)
+
+                    for component in components:
+                        packages = Package.objects.filter(
+                            pk__in=[
+                                prc.package.pk
+                                for prc in package_release_components
+                                if prc.release_component.component == component
+                            ]
+                        ).prefetch_related("contentartifact_set", "_artifacts")
+                        artifact_dict, remote_artifact_dict = _batch_fetch_artifacts(packages)
+                        release_helper.components[component].add_packages(
+                            packages,
+                            artifact_dict,
+                            remote_artifact_dict,
+                        )
+
+                        source_packages = [
+                            drc.source_package
+                            for drc in source_package_release_components
+                            if drc.release_component.component == component
+                        ]
+                        release_helper.components[component].add_source_packages(source_packages)
 
                     release_helper.save_unsigned_metadata()
                     release_helpers.append(release_helper)
@@ -323,47 +341,77 @@ class _ComponentHelper:
             source_index_path,
         )
 
-    def add_package(self, package):
-        with suppress(IntegrityError):
-            published_artifact = PublishedArtifact(
-                relative_path=package.filename(self.component),
-                publication=self.parent.publication,
-                content_artifact=package.contentartifact_set.get(),
-            )
-            published_artifact.save()
-        package_serializer = Package822Serializer(package, context={"request": None})
+    def add_packages(self, packages, artifact_dict, remote_artifact_dict):
+        published_artifacts = []
+        package_data = []
 
-        try:
-            package_serializer.to822(self.component).dump(
-                self.package_index_files[package.architecture][0]
-            )
-        except KeyError:
-            log.warn(
-                f"Published package '{package.relative_path}' with architecture "
-                f"'{package.architecture}' was not added to component '{self.component}' in "
-                f"distribution '{self.parent.distribution}' because it lacks this architecture!"
-            )
-        else:
-            self.package_index_files[package.architecture][0].write(b"\n")
+        content_artifacts = {
+            package.pk: list(package.contentartifact_set.all()) for package in packages
+        }
 
-    # Publish DSC file and setup to create Sources Indices file
-    def add_source_package(self, source_package):
-        artifact_set = source_package.contentartifact_set.all()
-        for content_artifact in artifact_set:
+        for package in packages:
             with suppress(IntegrityError):
+                content_artifact = content_artifacts.get(package.pk, [None])[0]
+                relative_path = package.filename(self.component)
+
                 published_artifact = PublishedArtifact(
-                    relative_path=source_package.derived_path(
-                        os.path.basename(content_artifact.relative_path), self.component
-                    ),
+                    relative_path=relative_path,
                     publication=self.parent.publication,
                     content_artifact=content_artifact,
                 )
-                published_artifact.save()
-        dsc_file_822_serializer = DscFile822Serializer(source_package, context={"request": None})
-        dsc_file_822_serializer.to822(self.component, paragraph=True).dump(
-            self.source_index_file_info[0]
-        )
-        self.source_index_file_info[0].write(b"\n")
+                published_artifacts.append(published_artifact)
+                package_data.append((package, package.architecture))
+
+        with transaction.atomic():
+            if published_artifacts:
+                PublishedArtifact.objects.bulk_create(published_artifacts, ignore_conflicts=True)
+
+        for package, architecture in package_data:
+            package_serializer = Package822Serializer(package, context={"request": None})
+            try:
+                package_serializer.to822(self.component, artifact_dict, remote_artifact_dict).dump(
+                    self.package_index_files[architecture][0]
+                )
+            except KeyError:
+                log.warn(
+                    f"Published package '{package.relative_path}' with architecture "
+                    f"'{architecture}' was not added to component '{self.component}' in "
+                    f"distribution '{self.parent.distribution}' because it lacks this architecture!"
+                )
+            else:
+                self.package_index_files[architecture][0].write(b"\n")
+
+    # Publish DSC file and setup to create Sources Indices file
+    def add_source_packages(self, source_packages):
+        published_artifacts = []
+        source_package_data = []
+
+        for source_package in source_packages:
+            with suppress(IntegrityError):
+                artifact_set = source_package.contentartifact_set.all()
+                for content_artifact in artifact_set:
+                    published_artifact = PublishedArtifact(
+                        relative_path=source_package.derived_path(
+                            os.path.basename(content_artifact.relative_path), self.component
+                        ),
+                        publication=self.parent.publication,
+                        content_artifact=content_artifact,
+                    )
+                    published_artifacts.append(published_artifact)
+                source_package_data.append(source_package)
+
+        with transaction.atomic():
+            if published_artifacts:
+                PublishedArtifact.objects.bulk_create(published_artifacts, ignore_conflicts=True)
+
+        for source_package in source_package_data:
+            dsc_file_822_serializer = DscFile822Serializer(
+                source_package, context={"request": None}
+            )
+            dsc_file_822_serializer.to822(self.component, paragraph=True).dump(
+                self.source_index_file_info[0]
+            )
+            self.source_index_file_info[0].write(b"\n")
 
     def finish(self):
         # Publish Packages files
@@ -550,3 +598,14 @@ def _fetch_file_checksum(file_path, index, checksum):
     checksum_type = CHECKSUM_TYPE_MAP[checksum]
     hashed_path = Path(file_path).parents[0] / "by-hash" / checksum_type / digest
     return hashed_path
+
+
+def _batch_fetch_artifacts(packages):
+    sha256_values = [package.sha256 for package in packages if package.sha256]
+    artifacts = Artifact.objects.filter(sha256__in=sha256_values)
+    artifact_dict = {artifact.sha256: artifact for artifact in artifacts}
+
+    remote_artifacts = RemoteArtifact.objects.filter(sha256__in=sha256_values)
+    remote_artifact_dict = {artifact.sha256: artifact for artifact in remote_artifacts}
+
+    return artifact_dict, remote_artifact_dict
